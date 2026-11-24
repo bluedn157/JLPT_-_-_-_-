@@ -1,0 +1,592 @@
+// JLPT 일본어 어휘 맞히기 모듈 (플래시 암산 모듈을 변형한 버전)
+// - 4지선다 객관식, 개인전입니다. (선착순 없음)
+// - 각자 보기를 마우스 클릭으로만 고릅니다. 전원이 고르기 전까지는 바꿀 수 있습니다.
+// - 접속 중인 모든 플레이어가 선택을 마치면 정답을 공개합니다. (제한시간이 끝나도 공개)
+// - 누군가 "처음으로" 보기를 고를 때마다 남은 시간이 2초 줄어듭니다. (선택을 바꿀 때는 줄지 않습니다.)
+// - 정답 공개 화면에 단어의 뜻이 표시되고, 정답자는 각자 1점을 얻습니다.
+// - 난이도는 초급(0) / 고급(1) / 초급+고급(2) 세 가지입니다. 문제 질문 왼쪽에 그 문제의 난이도가 표시됩니다.
+// - 틀린 문제는 자동으로, 맨 아래 줄의 [문제 저장] 버튼을 누른 문제는 직접 단어장에 저장됩니다. (다시 누르면 취소)
+// - 맵이 끝나면 각자 자신의 단어장(한자 [읽기] = 뜻)을 한 페이지에 5문제씩 볼 수 있습니다.
+//   페이지는 7번째 줄을 마우스로 클릭해서 넘깁니다. (왼쪽 이전 / 오른쪽 다음)
+// - 문제 순서와 보기 순서는 매번 무작위로 섞입니다.
+//
+// 문제 데이터는 이 파일이 아니라 Map/questions.csv 에서 관리합니다.
+// 빌드할 때 build_settings.py 가 읽어서 아래 import 하는 배열들을 만들어 줍니다.
+
+import MusicSetting as ms;
+import functions as fc;
+import build_settings.QuestionSentences;   // 예문 (읽기를 묻는 단어는 색칠되어 있음)
+import build_settings.QuestionChoices;     // 문제당 보기 4개씩. 각 문제의 첫 번째 보기가 정답
+import build_settings.QuestionMeanings;    // 정답 공개 때 표시할 "단어 = 뜻"
+import build_settings.QuestionNotes;       // 오답 노트에 표시할 "단어 [읽기] = 뜻"
+import build_settings.QuestionLevels;      // 문제별 난이도 (0: 초급, 1: 고급)
+import build_settings.PoolFirst;           // (난이도, 세트)별 문제 구간의 첫 위치. 구간 번호 = 난이도 * SetStride + 세트 번호
+import build_settings.PoolCount;           // (난이도, 세트)별 문제 구간의 문제 수
+import build_settings.SetCount;            // 세트 개수 (세트 번호는 1 ~ SetCount, 0은 전체 세트)
+import build_settings.SetStride;           // SetCount + 1
+import build_settings.MaxLevelCount;       // 전체 문제 수
+
+const ANSWER = $U("Jump Gate");
+const s = StringBuffer(1024);
+
+const questionPrompt = Db("색칠한 단어를 올바르게 읽은 것은?");
+
+// ===========================================================================
+// 진행 설정 (36프레임 = 1초)
+// ===========================================================================
+const SAVE_KIND_WRONG = 1;          // 단어장에 저장된 경로: 틀려서 자동 저장
+const SAVE_KIND_MANUAL = 2;         // 단어장에 저장된 경로: [저장] 버튼으로 직접 저장
+const SAVE_X_MIN = 3979;            // [문제 저장] 버튼 클릭 구간: 화면 맨 아래(8번째) 줄 전체. (보기 줄과 같은 방식)
+const SAVE_X_MAX = 4223;
+const SAVE_Y_MIN = 4130;            // 8번째 줄 y = 4098 + (8 - 6) * 16
+const SAVE_Y_MAX = 4141;
+const NOTE_PER_PAGE = 5;            // 오답 노트 한 페이지에 보이는 문제 수
+const QUESTION_FRAMES = 1080;       // 선택 제한시간 30초
+const TIME_PENALTY_FRAMES = 36;     // 누군가 처음 선택할 때마다 줄어드는 시간 1초
+const RESULT_FRAMES = 180;          // 정답 공개 화면 5초
+const PAUSE_FRAMES = 36;            // 문제 시작 전 빈 화면 1초
+const GAME_QUESTIONS = 100;          // 한 판에 출제할 문제 수 (난이도의 문제 수가 이보다 적으면 전부 냅니다.)
+const SHUFFLE_QUESTIONS = 1;        // 1이면 문제 순서를 섞고, 0이면 questions.csv에 적은 순서대로 냅니다.
+
+var gameStarted = 0;
+var gamePhase = 0;       // 1: 문제/선택, 3: 정답 공개, 4: 종료, 6: 문제 직전 빈 화면, 7: 난이도 메뉴 (0, 2, 5번은 사용하지 않음)
+var frameTimer = 0;
+var questionNumber = 0;  // 현재 난이도 안에서의 문제 번호 (1부터)
+var levelTotal = 1;      // 현재 난이도의 문제 수
+var currentQ = 0;        // 현재 문제의 문제 데이터 위치
+var correctChoice = 0;   // 현재 문제의 정답 보기 번호 (섞인 뒤 기준, 1~4)
+var chosenCount = 0;     // 선택을 마친 플레이어 수
+var humanCount = 0;      // 접속 중인 플레이어 수
+var resultCorrectCount = 0;
+const playerChoice = EUDArray(7);   // 플레이어별 선택 (0: 미선택, 1~4: 화면에 보이는 보기 번호)
+var choiceSet = 0;                  // 이번 문제의 선지 세트 (0: 세트 A, 1: 세트 B)
+const choiceOrder = EUDArray(4);    // 화면 보기 순서: 화면의 k+1번 보기 = 원래 보기 choiceOrder[k]
+const questionOrder = EUDArray(MaxLevelCount);   // 이번 게임의 문제 순서 (문제 데이터 위치)
+var difficultyMenuOpen = 0;
+var menuSet = 0;                    // 난이도 메뉴에서 고른 세트 (0: 전체 세트). 난이도를 클릭하면 적용됩니다.
+var poolAvail = 0;                  // 출제 후보로 모은 안 푼 문제 수
+var menuResumeSolvedQuestion = 0;
+const solved = EUDArray(MaxLevelCount);             // 정답을 공개한 문제 표시 (문제 데이터 위치 기준, 1이면 이미 푼 문제)
+var totalReveals = 0;               // 지금까지 정답을 공개한 문제 수 (단어장 제목의 "푼 문제"에 씁니다.)
+const wrongCount = EUDArray(7);                      // 플레이어별 틀린 문제 수
+const wrongQ = EUDArray(7 * MaxLevelCount);          // 플레이어별 틀린 문제의 데이터 위치 (푼 순서대로)
+const wrongNo = EUDArray(7 * MaxLevelCount);         // 플레이어별 틀린 문제의 문제 번호 (푼 순서대로)
+const wrongSrc = EUDArray(7 * MaxLevelCount);        // 플레이어별 단어장 항목의 저장 경로 (SAVE_KIND_*)
+const saveKind = EUDArray(7 * MaxLevelCount);        // [플레이어 * MaxLevelCount + 문제 위치] 이미 저장했는지 (0: 안 함, 아니면 SAVE_KIND_*)
+const pendingSave = EUDArray(7);                      // 풀이 중 [문제 저장]을 눌러 둔 플레이어 표시 (1이면 정답 공개 때 단어장에 저장). 문제가 무효가 되면 함께 사라집니다.
+const notePage = EUDArray(7);                        // 플레이어별 오답 노트 현재 페이지 (0부터)
+
+// 이전 화면 문구를 덮어쓰기 위한 빈 줄 추가 (화면은 항상 11줄로 맞춥니다.)
+function appendBlankRows(count) {
+    for (var r = 0; r < count; r++) {
+        s.append("\n\x13\x1F                                                        ");
+    }
+}
+
+// 앞으로 낼 문제를 정합니다. 이미 푼 문제는 제외하고, 부분 셔플로 필요한 만큼만 뽑습니다.
+// questionOrder[0 ~ base-1]은 이미 푼 문제 자리이므로 건드리지 않고, base번째 자리부터 새로 채웁니다.
+// (base = 지금까지 정답을 공개한 문제 수. 게임 시작 때는 0)
+// 후보는 고른 난이도와 세트에 속한 안 푼 문제이고, questionOrder에는 문제 데이터 위치를 그대로 담습니다.
+
+// 난이도 level(0: 초급, 1: 고급)의 현재 세트에서 안 푼 문제를 questionOrder[base + poolAvail]부터 모읍니다.
+function addPool(level, base) {
+    var range = level * SetStride + ms.setNumber;
+    var first = PoolFirst[range];
+    var count = PoolCount[range];
+    for (var i = 0; i < count; i++) {
+        if (solved[first + i] == 0) {
+            questionOrder[base + poolAvail] = first + i;
+            poolAvail++;
+        }
+    }
+}
+
+function shuffleQuestionOrder() {
+    var temp;
+    var rand;
+    var base = totalReveals;
+    var remaining = 0;
+    poolAvail = 0;
+    if (ms.difficulty != 1) addPool(0, base);   // 초급 또는 초급 + 고급
+    if (ms.difficulty != 0) addPool(1, base);   // 고급 또는 초급 + 고급
+    var avail = poolAvail;
+    if (base < GAME_QUESTIONS) remaining = GAME_QUESTIONS - base;
+    var picks = avail;
+    if (picks > remaining) picks = remaining;
+    if (SHUFFLE_QUESTIONS == 1) {
+        for (var j = 0; j < picks; j++) {
+            rand = dwrand() % (avail - j) + j;
+            temp = questionOrder[base + j];
+            questionOrder[base + j] = questionOrder[base + rand];
+            questionOrder[base + rand] = temp;
+        }
+    }
+    levelTotal = base + picks;
+}
+
+// 이번 판의 문제 수와 문제 순서를 새로 정합니다.
+function refreshLevelTotal() {
+    shuffleQuestionOrder();
+}
+
+// 보기 순서를 무작위로 섞고, 섞인 뒤의 정답 번호를 구합니다. (원래 정답은 항상 0번째 보기)
+function shuffleChoices() {
+    var temp;
+    var rand;
+    var n = 4;
+    for (var i = 0; i < 4; i++) {
+        choiceOrder[i] = i;
+    }
+    for (var j = 0; j < 3; j++) {
+        rand = dwrand() % (n - j) + j;
+        temp = choiceOrder[j];
+        choiceOrder[j] = choiceOrder[rand];
+        choiceOrder[rand] = temp;
+    }
+
+    correctChoice = 0;
+    for (var k = 0; k < 4; k++) {
+        if (choiceOrder[k] == 0) {
+            correctChoice = k + 1;
+        }
+    }
+}
+
+function makeProblem() {
+    // questionNumber번째 문제의 위치를 바로 가져옵니다.
+    currentQ = questionOrder[questionNumber - 1];
+    choiceSet = dwrand() % 2;   // 선지 세트 A/B 중 하나를 무작위로 고릅니다.
+    shuffleChoices();
+
+    for (var j = 0; j < 7; j++) {
+        playerChoice[j] = 0;
+        pendingSave[j] = 0;
+    }
+    chosenCount = 0;
+    humanCount = 0;
+    resultCorrectCount = 0;
+    gamePhase = 1;
+    frameTimer = QUESTION_FRAMES;
+    fc.mouseSwitch(0);      // 보기 클릭을 받기 위해 마우스 입력 활성화
+}
+
+function startGame() {
+    if (gameStarted == 0) {
+        gameStarted = 1;
+        questionNumber = 1;
+        refreshLevelTotal();
+        gamePhase = 6;           // 오프닝 종료 후 1초간 빈 화면
+        frameTimer = PAUSE_FRAMES;
+    }
+}
+
+// 접속 중인 플레이어 수와 선택 완료 인원을 갱신합니다. (나간 플레이어는 자동으로 빠집니다.)
+function updateChoiceStatus() {
+    var chosen = 0;
+    var humans = 0;
+    foreach (p : EUDLoopPlayer('Human')) {
+        humans++;
+        if (playerChoice[p] != 0) {
+            chosen++;
+        }
+    }
+    chosenCount = chosen;
+    humanCount = humans;
+}
+
+// 플레이어 p의 단어장에 현재 문제를 저장합니다. 이미 저장된 문제는 다시 저장하지 않습니다.
+// kind: SAVE_KIND_WRONG(틀려서 자동 저장) 또는 SAVE_KIND_MANUAL([저장] 버튼)
+function saveWord(p, kind) {
+    var n = wrongCount[p];
+    if (saveKind[p * MaxLevelCount + currentQ] == 0 && n < MaxLevelCount) {
+        wrongQ[p * MaxLevelCount + n] = currentQ;
+        wrongNo[p * MaxLevelCount + n] = questionNumber;
+        wrongSrc[p * MaxLevelCount + n] = kind;
+        saveKind[p * MaxLevelCount + currentQ] = kind;
+        wrongCount[p] = n + 1;
+    }
+}
+
+// 플레이어 p가 틀린 현재 문제를 단어장에 자동 저장합니다.
+function recordWrong(p) {
+    saveWord(p, SAVE_KIND_WRONG);
+}
+
+// 플레이어 p의 단어장에서 현재 문제를 뺍니다. (뒤 항목들을 한 칸씩 앞으로 당깁니다.)
+function removeWord(p) {
+    var n = wrongCount[p];
+    var base = p * MaxLevelCount;
+    var found = 0;
+    for (var i = 0; i < n; i++) {
+        if (found == 0) {
+            if (wrongQ[base + i] == currentQ) {
+                found = 1;
+            }
+        }
+        if (found == 1 && i + 1 < n) {
+            wrongQ[base + i] = wrongQ[base + i + 1];
+            wrongNo[base + i] = wrongNo[base + i + 1];
+            wrongSrc[base + i] = wrongSrc[base + i + 1];
+        }
+    }
+    if (found == 1) {
+        wrongCount[p] = n - 1;
+        saveKind[base + currentQ] = 0;
+        SetDeaths(p, SetTo, 2, ms.EFFECT);   // 취소 클릭음
+    }
+}
+
+// 풀이 중 [문제 저장] 버튼: 저장 예약을 켜고 끕니다. 단어장에는 정답이 공개될 때 들어갑니다.
+// (문제를 풀지 않고 난이도·세트를 바꾸면 예약은 사라집니다.)
+function togglePendingSave(p) {
+    if (pendingSave[p] == 0) pendingSave[p] = 1;
+    else pendingSave[p] = 0;
+    SetDeaths(p, SetTo, 2, ms.EFFECT);   // 클릭음
+}
+
+// 정답 공개 화면의 [문제 저장] 버튼: 저장 안 된 문제는 저장하고, 이미 저장된 문제는 취소합니다.
+function toggleSaveWord(p) {
+    if (saveKind[p * MaxLevelCount + currentQ] == 0) {
+        saveWord(p, SAVE_KIND_MANUAL);
+        SetDeaths(p, SetTo, 2, ms.EFFECT);   // 저장 클릭음
+    }
+    else {
+        removeWord(p);
+    }
+}
+
+// 정답을 공개하고 정답자에게 점수를 줍니다. 틀린(또는 선택하지 않은) 플레이어는 단어장에 자동 저장합니다.
+function revealResult() {
+    var correct = 0;
+    totalReveals++;
+    solved[currentQ] = 1;
+    foreach (p : EUDLoopPlayer('Human')) {
+        // 풀이 중 저장을 눌러 둔 문제는 직접 저장으로 먼저 기록합니다. (이후 틀려도 한 번만 저장됩니다.)
+        if (pendingSave[p] == 1) {
+            saveWord(p, SAVE_KIND_MANUAL);
+        }
+        if (playerChoice[p] == correctChoice) {
+            correct++;
+            SetScore(p, Add, 1, Custom);
+            SetDeaths(p, SetTo, 5, ms.EFFECT);   // 정답 효과음
+        }
+        else {
+            recordWrong(p);
+        }
+    }
+    resultCorrectCount = correct;
+    gamePhase = 3;
+    frameTimer = RESULT_FRAMES;
+    fc.mouseSwitch(0);      // 정답 공개 화면에서도 [문제 저장] 클릭을 받기 위해 마우스 입력을 계속 활성화합니다.
+}
+
+// 모든 문제가 끝났을 때 종료 화면(오답 노트)으로 넘어갑니다.
+function enterEndScreen() {
+    gamePhase = 4;
+    frameTimer = 0;
+    for (var i = 0; i < 7; i++) {
+        notePage[i] = 0;
+    }
+    fc.mouseSwitch(0);      // 오답 노트 페이지를 클릭으로 넘기기 위해 마우스 입력 활성화
+}
+
+// 플레이어 cp의 오답 노트 페이지를 넘깁니다. (dir: 1 = 다음, 0 = 이전)
+function notePageMove(cp, dir) {
+    var pages = (wrongCount[cp] + NOTE_PER_PAGE - 1) / NOTE_PER_PAGE;
+    if (dir == 1) {
+        if (notePage[cp] + 1 < pages) {
+            notePage[cp]++;
+            SetDeaths(cp, SetTo, 2, ms.EFFECT);   // 클릭음
+        }
+    }
+    else {
+        if (notePage[cp] > 0) {
+            notePage[cp]--;
+            SetDeaths(cp, SetTo, 2, ms.EFFECT);
+        }
+    }
+}
+
+function arithmeticSystem() {
+    if (gameStarted == 0 || gamePhase == 4) return;
+
+    if (frameTimer > 0) frameTimer--;
+
+    if (gamePhase == 1) {
+        // 전원이 선택했거나 제한시간이 끝나면 정답을 공개합니다.
+        updateChoiceStatus();
+        var shouldReveal = 0;
+        if (frameTimer == 0) shouldReveal = 1;
+        if (humanCount > 0 && chosenCount == humanCount) shouldReveal = 1;
+        if (shouldReveal == 1) {
+            revealResult();
+        }
+    }
+    else if (gamePhase == 3 && frameTimer == 0) {
+        if (questionNumber >= levelTotal) {
+            enterEndScreen();
+        }
+        else {
+            questionNumber++;
+            gamePhase = 6;
+            frameTimer = PAUSE_FRAMES;
+        }
+    }
+    else if (gamePhase == 6 && frameTimer == 0) {
+        makeProblem();
+    }
+}
+
+function openDifficultyMenu() {
+    if (gameStarted == 0 || gamePhase == 4 || difficultyMenuOpen == 1) return;
+
+    // 정답 공개 단계라면 현재 문제는 이미 끝난 것으로 처리합니다.
+    if (gamePhase == 3) menuResumeSolvedQuestion = 1;
+    else menuResumeSolvedQuestion = 0;
+    difficultyMenuOpen = 1;
+    menuSet = ms.setNumber;  // 메뉴는 지금 세트에서 시작합니다.
+    gamePhase = 7;          // 난이도 선택 화면
+    frameTimer = 0;         // 진행 중인 문제 타이머 중단
+    fc.mouseSwitch(0);      // 난이도 선택 중 마우스 입력 활성화
+}
+
+function selectDifficulty(cp, selectedDifficulty) {
+    ms.difficulty = selectedDifficulty;
+    ms.setNumber = menuSet;
+    difficultyMenuOpen = 0;
+    fc.mouseSwitch(0);      // 선택이 끝나면 마우스 입력 비활성화
+    SetDeaths(Force1, SetTo, 4, ms.EFFECT);
+    refreshLevelTotal();    // 새 난이도의 문제 수를 불러오고 문제 순서를 새로 정합니다.
+
+    if (menuResumeSolvedQuestion == 1) {
+        // 이미 정답이 공개된 문제의 점수는 유지하고 다음 문제로 진행합니다.
+        menuResumeSolvedQuestion = 0;
+        if (questionNumber >= levelTotal) {
+            enterEndScreen();
+        }
+        else {
+            questionNumber++;
+            gamePhase = 6;
+            frameTimer = PAUSE_FRAMES;
+        }
+    }
+    else {
+        // 진행 중이던 문제는 무효 처리하고 같은 문제 번호로 새 난이도에서 다시 출제합니다. (선택도 초기화됩니다.)
+        // 새 난이도에 낼 문제가 남아 있지 않으면 바로 오답 노트로 갑니다.
+        if (levelTotal <= totalReveals) {
+            enterEndScreen();
+        }
+        else {
+            gamePhase = 6;
+            frameTimer = PAUSE_FRAMES;
+            correctChoice = 0;
+            resultCorrectCount = 0;
+        }
+    }
+}
+
+// 플레이어 cp가 보기 choice(1~4)를 고릅니다. 같은 보기를 다시 눌러도 소리는 한 번만 납니다.
+function chooseAnswer(cp, choice) {
+    if (gamePhase != 1) return;
+    if (playerChoice[cp] != choice) {
+        // 처음 선택하는 경우에만 남은 시간이 2초 줄어듭니다. (선택을 바꿀 때는 줄지 않습니다.)
+        if (playerChoice[cp] == 0) {
+            if (frameTimer > TIME_PENALTY_FRAMES) frameTimer -= TIME_PENALTY_FRAMES;
+            else frameTimer = 1;
+        }
+        playerChoice[cp] = choice;
+        SetDeaths(cp, SetTo, 2, ms.EFFECT);   // 선택 클릭음
+    }
+}
+
+function arithmeticPlay(cp) {
+    if (gameStarted == 0) return;
+
+    // !난이도(100007)는 방장에게 입력된 경우에만 실행합니다.
+    // 기존 !강퇴1~7(100000~100006) 명령어와 번호가 겹치지 않습니다.
+    if (cp == fc.superUser && Deaths(cp, Exactly, 100007, ANSWER)) {
+        SetDeaths(cp, SetTo, 0, ANSWER);
+        openDifficultyMenu();
+        if (difficultyMenuOpen == 1) {
+            SetDeaths(Force1, SetTo, 2, ms.EFFECT);
+        }
+    }
+
+    // 난이도 선택은 방장만 할 수 있습니다.
+    if (difficultyMenuOpen == 1 && cp == fc.superUser) {
+        // 메뉴 클릭 판정 좌표(4096, 4096 기준)가 맞도록 메뉴가 열려 있는 동안 방장 화면을 맵 중앙에 고정합니다.
+        // (오프닝의 CenterView("Anywhere")와 같은 방식. 선택이 끝나면 다시 화면이 풀립니다.)
+        CenterView("Anywhere");
+        fc.mouseTrack(cp);
+        const mmX, mmY = fc.mX[cp], fc.mY[cp];
+        // 3번째 줄(y = 4098 + (3 - 6) * 16 = 4050): 세트 선택. 왼쪽 절반은 이전, 오른쪽 절반은 다음입니다. (0번 = 전체 세트)
+        if (Deaths(cp, Exactly, 1, ms.MOUSE) && 3979 <= mmX && mmX <= 4223 && 4050 <= mmY && mmY <= 4061) {
+            if (mmX < 4101) {
+                if (menuSet == 0) menuSet = SetCount;
+                else menuSet = menuSet - 1;
+            }
+            else {
+                if (menuSet == SetCount) menuSet = 0;
+                else menuSet = menuSet + 1;
+            }
+            SetDeaths(cp, SetTo, 2, ms.EFFECT);
+        }
+        if (Deaths(cp, Exactly, 1, ms.MOUSE) && 3979 <= mmX && mmX <= 4223) {
+            for (var i = 0; i < 3; i++) {
+                const rowTop = 4082 + i * 16;   // 메뉴 보기는 화면의 5~7번째 줄
+                if (rowTop <= mmY && mmY <= rowTop + 11) {
+                    selectDifficulty(cp, i);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 문제 진행 중: 화면을 맵 중앙에 고정하고, 보기 클릭을 읽습니다.
+    // 보기 1~4번은 화면 텍스트의 4~7번째 줄입니다. (오프닝 난이도 메뉴와 같은 좌표계: 6번째 줄 y=4098, 줄 간격 16 → 4번째 줄 y=4066)
+    if (gamePhase == 1) {
+        CenterView("Anywhere");
+        fc.mouseTrack(cp);
+        const clickX, clickY = fc.mX[cp], fc.mY[cp];
+        if (Deaths(cp, Exactly, 1, ms.MOUSE) && SAVE_X_MIN <= clickX && clickX <= SAVE_X_MAX && SAVE_Y_MIN <= clickY && clickY <= SAVE_Y_MAX) {
+            togglePendingSave(cp);   // 맨 아래 줄 [문제 저장] 버튼 (풀이 중에는 예약만)
+        }
+        if (Deaths(cp, Exactly, 1, ms.MOUSE) && 3979 <= clickX && clickX <= 4223) {
+            for (var k = 0; k < 4; k++) {
+                const choiceTop = 4066 + k * 16;
+                if (choiceTop <= clickY && clickY <= choiceTop + 11) {
+                    chooseAnswer(cp, k + 1);
+                    break;
+                }
+            }
+        }
+    }
+
+    // 정답 공개 화면: 여기서도 [저장] 버튼을 누를 수 있습니다.
+    if (gamePhase == 3) {
+        CenterView("Anywhere");
+        fc.mouseTrack(cp);
+        const revX, revY = fc.mX[cp], fc.mY[cp];
+        if (Deaths(cp, Exactly, 1, ms.MOUSE) && SAVE_X_MIN <= revX && revX <= SAVE_X_MAX && SAVE_Y_MIN <= revY && revY <= SAVE_Y_MAX) {
+            toggleSaveWord(cp);
+        }
+    }
+
+    // 종료 화면: 화면을 맵 중앙에 고정하고, 맨 아래(7번째) 줄의 왼쪽 절반은 이전, 오른쪽 절반은 다음 페이지로 읽습니다.
+    // 7번째 줄의 y는 4098 + (7 - 6) * 16 = 4114 입니다. (같은 좌표계)
+    if (gamePhase == 4) {
+        CenterView("Anywhere");
+        fc.mouseTrack(cp);
+        const noteX, noteY = fc.mX[cp], fc.mY[cp];
+        if (Deaths(cp, Exactly, 1, ms.MOUSE) && 3979 <= noteX && noteX <= 4223 && 4114 <= noteY && noteY <= 4125) {
+            if (noteX < 4101) notePageMove(cp, 0);
+            else notePageMove(cp, 1);
+        }
+    }
+
+    s.insert(0);
+    if (gamePhase == 7) {
+        // 채팅이 3줄 이상 보이도록 화면은 8줄까지만 씁니다.
+        // 1줄 ┏ / 2줄 안내 / 3줄 세트 선택 / 4줄 제목 / 5~7줄 난이도 / 8줄 ┗
+        s.append("\x13\x19┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n");
+        s.append("\x13", PColor(fc.superUser), PName(fc.superUser), "\x04님이 난이도 변경을 요청했습니다.\n");
+        // 좌우 글자 수를 같게 해서 ◀ ▶가 화면 가운데를 기준으로 대칭이 되도록 합니다. (왼쪽 절반 클릭 = 이전, 오른쪽 절반 클릭 = 다음)
+        s.append("\x13\x04(클릭: 이전) \x1F◀ \x07");
+        if (menuSet == 0) s.append("전체 세트");
+        else s.append(menuSet, "세트");
+        s.append(" \x1F▶ \x04(클릭: 다음)\n");
+        s.append("\x13\x11난이도를 클릭하면 적용됩니다.\n");
+        for (var i = 0; i < 3; i++) {
+            s.append("\x13");
+            if (ms.difficulty == i) s.append("\x1F[*] ");
+            else s.append("\x05[ ] ");
+            if (i == 0) s.append("초급: \x07기본\x04 어휘 읽기\n");
+            else if (i == 1) s.append("고급: \x07어려운\x04 어휘 읽기\n");
+            else s.append("초급 + 고급: \x07모든\x04 어휘 읽기\n");
+        }
+        s.append("\x13\x19┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛");
+    }
+    else if (gamePhase == 1) {
+        // 채팅이 3줄 이상 보이도록 화면은 8줄까지만 씁니다.
+        // 1줄 문제 번호·남은 시간·선택 현황 / 2줄 지시문 / 3줄 예문 / 4~7줄 보기 / 8줄 [문제 저장]
+        s.append("\x13\x1E\x04문제 ", questionNumber, " / ", levelTotal, "   \x1F남은 시간: \x04", (frameTimer + 35) / 36, "초   \x1F선택 \x04", chosenCount, " / ", humanCount, "\n");
+        if (QuestionLevels[currentQ] == 0) s.append("\x13\x07[초급] \x11", ptr2s(questionPrompt), "\n");
+        else s.append("\x13\x08[고급] \x11", ptr2s(questionPrompt), "\n");
+        s.append("\x13\x04", ptr2s(QuestionSentences[currentQ]), "\n");
+        for (var i = 0; i < 4; i++) {
+            const num = i + 1;
+            s.append("\x13");
+            if (playerChoice[cp] == num) s.append("\x1F[*] ");
+            else s.append("\x05[ ] ");
+            s.append("\x04", num, ". ", ptr2s(QuestionChoices[currentQ * 8 + choiceSet * 4 + choiceOrder[i]]));
+            if (i < 3) s.append("\n");
+        }
+        // 8줄: [문제 저장] 버튼 (줄 전체가 버튼). 풀이 중에는 저장 예약 상태를 보여 줍니다.
+        if (pendingSave[cp] != 0) s.append("\n\x13\x07[저장됨] \x05(다시 누르면 취소)");
+        else s.append("\n\x13\x03[문제 저장]");
+    }
+    else if (gamePhase == 3) {
+        // 1줄 문제 번호·내 결과 / 2줄 뜻 / 3줄 정답자 / 4~7줄 보기 / 8줄 [문제 저장]
+        s.append("\x13\x1E\x04문제 ", questionNumber, " / ", levelTotal, "   ");
+        if (playerChoice[cp] == 0) s.append("\x08선택하지 않아 오답 처리되었습니다.\n");
+        else if (playerChoice[cp] == correctChoice) s.append("\x07정답입니다!\n");
+        else s.append("\x08오답입니다.\n");
+        s.append("\x13\x1F뜻 \x04: ", ptr2s(QuestionMeanings[currentQ]), "\n");
+        if (resultCorrectCount == 0) {
+            s.append("\x13\x08정답자가 없습니다.\n");
+        }
+        else {
+            s.append("\x13\x1F정답자 ", resultCorrectCount, "명:");
+            foreach (p : EUDLoopPlayer('Human')) {
+                if (playerChoice[p] == correctChoice) {
+                    s.append(" ", PColor(p), PName(p), "\x1F");
+                }
+            }
+            s.append("\n");
+        }
+        for (var i = 0; i < 4; i++) {
+            const num = i + 1;
+            s.append("\x13");
+            if (num == correctChoice) s.append("\x07[O] ");
+            else if (num == playerChoice[cp]) s.append("\x08[X] ");
+            else s.append("\x05[ ] ");
+            s.append("\x04", num, ". ", ptr2s(QuestionChoices[currentQ * 8 + choiceSet * 4 + choiceOrder[i]]));
+            if (i < 3) s.append("\n");
+        }
+        // 8줄: [문제 저장] 버튼 (줄 전체가 버튼)
+        if (saveKind[cp * MaxLevelCount + currentQ] != 0) s.append("\n\x13\x07[저장됨] \x05(다시 누르면 취소)");
+        else s.append("\n\x13\x03[문제 저장]");
+    }
+    else if (gamePhase == 6) {
+        // 문제 시작 전 1초 동안 화면을 비웁니다.
+        // 난이도 메뉴가 8줄이므로 8줄을 모두 덮어써야 메뉴의 아래 노란 줄이 남지 않습니다.
+        s.append("\x13\x1F                                                        ");
+        appendBlankRows(7);
+    }
+    else if (gamePhase == 4) {
+        // 단어장 (8줄): 1줄 제목 / 2~6줄 저장한 단어 5개 / 7줄 페이지 이동 / 8줄 빈 줄
+        // 틀린 문제가 없으면 1줄 제목 / 2줄 안내 / 나머지 빈 줄
+        const wc = wrongCount[cp];
+        s.append("\x13\x1E단어장 \x04- 저장한 단어 \x07", wc, "\x04개 / 푼 문제 ", totalReveals, "\n");
+        if (wc == 0) {
+            s.append("\x13\x07저장한 단어가 없습니다!");
+            appendBlankRows(5);
+        }
+        else {
+            const pages = (wc + NOTE_PER_PAGE - 1) / NOTE_PER_PAGE;
+            for (var i = 0; i < NOTE_PER_PAGE; i++) {
+                const idx = notePage[cp] * NOTE_PER_PAGE + i;
+                if (idx < wc) {
+                    s.append("\x13\x04", wrongNo[cp * MaxLevelCount + idx], ". ", ptr2s(QuestionNotes[wrongQ[cp * MaxLevelCount + idx]]), "\n");
+                }
+                else {
+                    s.append("\x13\x1F                                                        \n");
+                }
+            }
+            s.append("\x13\x1F◀ 이전 (클릭)      \x04", notePage[cp] + 1, " / ", pages, "      \x1F다음 (클릭) ▶");
+        }
+        // 8번째 줄: 종료 안내. (문제 화면의 [문제 저장] 줄을 덮어쓰는 역할도 합니다.)
+        s.append("\n\x13\x07모든 문제가 끝났습니다. \x04이제 나가셔도 됩니다.");
+    }
+    if (IsUserCP()) s.DisplayAt(0);
+}

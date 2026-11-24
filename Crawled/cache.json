@@ -1,0 +1,21 @@
+[
+  {
+    "OriginalAnswer": "컴퓨터 내 파일 작동 테스트",
+    "SongTitle": "Ring09",
+    "Hint": "d",
+    "Hint2": "",
+    "ChoseongHint": null,
+    "AnswerList": [
+      "테스트",
+      "컴퓨터내파일작동테스트"
+    ],
+    "MusicLinkOrFilePath": "C:\\Windows\\Media\\Ring09.wav",
+    "StartTime": "00:00:00",
+    "EndTime": "00:00:01",
+    "SegmentCount": 1,
+    "Category": "1",
+    "OpeningOrEnding": null,
+    "HashString": "53F021E158E8C27D83271E2AAF7A885C",
+    "Identifier": "컴퓨터 내 파일 작동 테스트, Ring09"
+  }
+]
