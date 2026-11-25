@@ -7,7 +7,7 @@ settings: dict[str]
 now = datetime.now().date().isoformat()
 
 def convert2b2(original):
-	return i2b2(GetStringIndex(original.replace('(날짜)', now)))
+	return i2b2(GetStringIndex(original.replace('(날짜)', now).replace('\\n', '\n')))
 
 def set_text():
 	chkt = GetChkTokenized()	
