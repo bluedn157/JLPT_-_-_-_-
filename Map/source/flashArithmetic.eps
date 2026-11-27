@@ -492,7 +492,7 @@ function arithmeticPlay(cp) {
         s.append("\x13", PColor(fc.superUser), PName(fc.superUser), "\x04님이 난이도 변경을 요청했습니다.\n");
         // 좌우 글자 수를 같게 해서 ◀ ▶가 화면 가운데를 기준으로 대칭이 되도록 합니다. (왼쪽 절반 클릭 = 이전, 오른쪽 절반 클릭 = 다음)
         s.append("\x13\x04(클릭: 이전) \x1F◀ \x07");
-        if (menuSet == 0) s.append("전체 세트 중 랜덤");
+        if (menuSet == 0) s.append("전체 문제 랜덤");
         else s.append(menuSet, "세트");
         s.append(" \x1F▶ \x04(클릭: 다음)\n");
         s.append("\x13\x11난이도를 클릭하면 적용됩니다.\n");
